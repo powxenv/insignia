@@ -9,6 +9,7 @@ import { stringify } from "csv-stringify";
 import pRetry from "p-retry";
 
 const PAGE_SIZE = 60;
+const DETAIL_CONCURRENCY = 5;
 const HEADERS = {
   "accept-language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
   "user-agent":
@@ -16,6 +17,17 @@ const HEADERS = {
 };
 
 type Cache = Record<string, any>;
+type SearchResult = {
+  count: number;
+  products: Array<{ id: string }>;
+};
+type ProductDetail = {
+  discountPercentage: number | "";
+  originalPrice: string;
+  rating: number | "";
+  reviewCount: string | number;
+  soldText: string;
+};
 
 function parsePositiveInt(value: string) {
   const parsed = Number.parseInt(value, 10);
@@ -33,7 +45,7 @@ function defaultOutputPath(categoryUrl: string) {
   return join(process.cwd(), "output", `${slug}-${timestamp}.csv`);
 }
 
-async function fetchPage(pageUrl: string) {
+async function fetchCache(pageUrl: string, label: string) {
   return pRetry(
     async () => {
       const response = await fetch(pageUrl, {
@@ -61,30 +73,76 @@ async function fetchPage(pageUrl: string) {
         .trim()
         .replace(/;$/, "");
 
-      const cache = JSON.parse(rawJson) as Cache;
-      const searchKey = Object.keys(cache).find((key) => key.startsWith("$ROOT_QUERY.searchProduct("));
-
-      if (!searchKey) {
-        throw new Error("Could not find product search data in the page.");
-      }
-
-      return {
-        cache,
-        search: cache[searchKey] as {
-          count: number;
-          products: Array<{ id: string }>;
-        },
-      };
+      return JSON.parse(rawJson) as Cache;
     },
     {
       retries: 3,
       minTimeout: 1_000,
       onFailedAttempt(error) {
         const message = error.error instanceof Error ? error.error.message : String(error.error);
-        console.warn(`Retry ${error.attemptNumber}: ${message}`);
+        console.warn(`Retry ${error.attemptNumber} (${label}): ${message}`);
       },
     },
   );
+}
+
+async function fetchCategoryPage(pageUrl: string) {
+  const cache = await fetchCache(pageUrl, `category page ${pageUrl}`);
+  const searchKey = Object.keys(cache).find((key) => key.startsWith("$ROOT_QUERY.searchProduct("));
+  if (!searchKey) {
+    throw new Error("Could not find product search data in the page.");
+  }
+
+  return {
+    cache,
+    search: cache[searchKey] as SearchResult,
+  };
+}
+
+async function fetchProductDetail(productUrl: string) {
+  const cache = await fetchCache(productUrl, `product detail ${productUrl}`);
+  const basicKey = Object.keys(cache).find((key) => /^pdpBasicInfo\d+$/.test(key));
+  if (!basicKey) {
+    throw new Error("Could not find PDP detail data in the page.");
+  }
+
+  const stats = cache[`$${basicKey}.stats`];
+  const txStats = cache[`$${basicKey}.txStats`];
+  const price = Object.values(cache).find(
+    (entry) => entry && typeof entry === "object" && entry.__typename === "pdpContentSnapshotPrice",
+  ) as
+    | {
+        priceFmt?: string;
+        slashPriceFmt?: string;
+        discPercentage?: string | number;
+      }
+    | undefined;
+  let discountPercentage: number | "" = "";
+
+  if (typeof price?.discPercentage === "number") {
+    discountPercentage = price.discPercentage;
+  } else if (typeof price?.discPercentage === "string") {
+    const parsed = Number.parseFloat(price.discPercentage.replace(/[^\d.-]/g, ""));
+    if (Number.isFinite(parsed)) {
+      discountPercentage = parsed;
+    }
+  }
+
+  let soldText = "";
+  if (typeof txStats?.itemSoldFmt === "string" && txStats.itemSoldFmt.trim()) {
+    soldText = `${txStats.itemSoldFmt.trim()} terjual`;
+  } else if (typeof txStats?.countSold === "string" && txStats.countSold.trim()) {
+    soldText = `${txStats.countSold.trim()} terjual`;
+  }
+
+  return {
+    discountPercentage,
+    originalPrice: price?.slashPriceFmt || "",
+    rating: typeof stats?.rating === "number" ? stats.rating : "",
+    reviewCount:
+      typeof stats?.countReview === "string" || typeof stats?.countReview === "number" ? stats.countReview : "",
+    soldText,
+  };
 }
 
 const program = new Command()
@@ -151,48 +209,63 @@ while (written < limit) {
     pageUrl.searchParams.delete("page");
   }
 
-  const { cache, search } = await fetchPage(pageUrl.toString());
+  const { cache, search } = await fetchCategoryPage(pageUrl.toString());
   totalAvailable = search.count;
 
   if (search.products.length === 0) {
     break;
   }
 
-  for (const [index, reference] of search.products.entries()) {
-    if (written >= limit) {
-      break;
-    }
+  const pageProducts = search.products
+    .map((reference) => cache[reference.id])
+    .filter((product): product is any => Boolean(product));
+  const pageLimit = Number.isFinite(limit) ? Math.max(limit - written, 0) : pageProducts.length;
+  const productsToProcess = pageProducts.slice(0, pageLimit);
 
-    const product = cache[reference.id];
-    if (!product) {
-      continue;
-    }
+  for (let batchStart = 0; batchStart < productsToProcess.length; batchStart += DETAIL_CONCURRENCY) {
+    const batchProducts = productsToProcess.slice(batchStart, batchStart + DETAIL_CONCURRENCY);
+    const batchDetails = await Promise.all(
+      batchProducts.map(async (product) => {
+        try {
+          return await fetchProductDetail(product.url);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`Falling back to listing data for ${product.url}: ${message}`);
+          return null;
+        }
+      }),
+    );
 
-    const shop = product.shop ? cache[product.shop.id] : null;
-    const soldText =
-      (product.label_groups || [])
-        .map((label: { id: string }) => cache[label.id]?.title)
-        .find((title: unknown) => typeof title === "string" && /terjual|sold/i.test(title)) || "";
+    for (const [index, product] of batchProducts.entries()) {
+      const detail = batchDetails[index];
+      const shop = product.shop ? cache[product.shop.id] : null;
+      const soldText =
+        detail?.soldText ||
+        (product.label_groups || [])
+          .map((label: { id: string }) => cache[label.id]?.title)
+          .find((title: unknown) => typeof title === "string" && /terjual|sold/i.test(title)) ||
+        "";
 
-    written += 1;
+      written += 1;
 
-    if (!csv.write({
-      product_id: String(product.id),
-      product_name: product.name || "",
-      price: product.price || "",
-      price_int: product.price_int ?? "",
-      original_price: product.original_price || "",
-      discount_percentage: product.discount_percentage ?? "",
-      rating: product.rating ?? "",
-      review_count: product.count_review ?? "",
-      sold_text: soldText,
-      shop_id: shop ? String(shop.id) : "",
-      shop_name: shop?.name || "",
-      shop_city: shop?.city || shop?.location || "",
-      product_url: product.url || "",
-      image_url: product.image_url || "",
-    })) {
-      await once(csv, "drain");
+      if (!csv.write({
+        product_id: String(product.id),
+        product_name: product.name || "",
+        price: product.price || "",
+        price_int: product.price_int ?? "",
+        original_price: detail?.originalPrice || product.original_price || "",
+        discount_percentage: detail?.discountPercentage ?? product.discount_percentage ?? "",
+        rating: detail?.rating ?? product.rating ?? "",
+        review_count: detail?.reviewCount ?? product.count_review ?? "",
+        sold_text: soldText,
+        shop_id: shop ? String(shop.id) : "",
+        shop_name: shop?.name || "",
+        shop_city: shop?.city || shop?.location || "",
+        product_url: product.url || "",
+        image_url: product.image_url || "",
+      })) {
+        await once(csv, "drain");
+      }
     }
   }
 
